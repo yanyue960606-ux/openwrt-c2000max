@@ -50,6 +50,12 @@ jobs:
             swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
           sudo pip3 install pyelftools --break-system-packages
           sudo timedatectl set-timezone Asia/Shanghai
+          ccache --max-size=2G || true
+
+      - name: Disk report (before)
+        run: |
+          df -h /
+          sudo du -xhd1 / 2>/dev/null | sort -hr | head -10 || true
 
       - name: Clone ImmortalWrt source
         run: |
@@ -78,11 +84,33 @@ jobs:
       - name: Apply custom packages via seed config
         working-directory: immortalwrt
         run: |
-          # Apply custom package selections
           if [ -f ../configs/c2000max-packages.seed ]; then
             cat ../configs/c2000max-packages.seed >> .config
             make defconfig
           fi
+          echo "=== packages actually enabled ==="
+          grep -E '^CONFIG_PACKAGE_.*=y$' .config | sed 's/^CONFIG_PACKAGE_//;s/=y$//' | sort > ../selected-packages.txt
+          wc -l ../selected-packages.txt
+
+      - name: Verify MTK WiFi kconfig (fail fast, ~1 min)
+        working-directory: immortalwrt
+        run: |
+          # mt_wifi_ap/Makefile: obj-$(CONFIG_MT_WIFI) += mt_wifi.o
+          # 只要 CONFIG_MT_WIFI 为空，就永远不会生成 mt_wifi.ko，
+          # 3 小时后才会报 "ERROR: module .../mt_wifi.ko is missing."
+          echo "CONFIG_MTK_WIFI7_* 行数: $(grep -c '^CONFIG_MTK_WIFI7_' .config || true)"
+          if ! grep -q '^CONFIG_MTK_WIFI7_MT_WIFI=m' .config; then
+            echo "::warning::MTK_WIFI7 配置块丢失，尝试从 vendor defconfig 重新注入"
+            grep '^CONFIG_MTK_WIFI7_' defconfig/mt7987_mt7992.config >> .config
+            make defconfig
+            echo "重注入后行数: $(grep -c '^CONFIG_MTK_WIFI7_' .config || true)"
+          fi
+          grep -q '^CONFIG_MTK_WIFI7_MT_WIFI=m' .config \
+            || { echo "::error::CONFIG_MTK_WIFI7_MT_WIFI 仍然缺失，继续编译必然失败（提前在这里停下）"; exit 1; }
+          grep -q '^CONFIG_MTK_WIFI7_MT_AP_SUPPORT=m' .config || echo "::warning::MT_AP_SUPPORT 缺失"
+          grep -q '^CONFIG_MTK_WIFI7_FIRST_IF_MT7992=y' .config || echo "::warning::FIRST_IF_MT7992 缺失，WiFi 可能无法工作"
+          grep -q '^CONFIG_MTK_WIFI7_CHIP_MT7992=y' .config || echo "::warning::CHIP_MT7992 缺失"
+          grep -E '^CONFIG_MTK_WIFI7_(MT_WIFI|MT_AP_SUPPORT|FIRST_IF_MT7992|FIRST_IF_NONE|CHIP_MT7992|SKU_TYPE)=' .config || true
 
       - name: Run post-build customization (diy-part2.sh)
         working-directory: immortalwrt
@@ -105,13 +133,43 @@ jobs:
         run: |
           make download -j$(nproc) || make download -j1 V=s
 
+      - name: Disk report (after download)
+        run: df -h /
+
       - name: Build firmware
         working-directory: immortalwrt
         run: |
-          make -j$(nproc) V=s || make -j1 V=s
+          set -o pipefail
+          make -j$(nproc) V=s 2>&1 | tee ../build.log || {
+            echo "::warning::parallel build failed, retrying with -j1 (log appended)"
+            make -j1 V=s 2>&1 | tee -a ../build.log
+          }
+
+      - name: Disk report (after build)
+        if: always()
+        run: df -h /
+
+      - name: Show build errors
+        if: failure()
+        run: |
+          echo "================ LAST 80 LINES ================"
+          tail -80 build.log || true
+          echo "================ ERROR HITS =================="
+          grep -nE "Error [0-9]+|error:|check_data_file_clashes|Cannot install package|No space left|undefined reference|is missing dependencies" build.log | tail -40 || true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: |
+            build.log
+            selected-packages.txt
+          retention-days: 14
 
       - name: Package firmware artifacts
         id: package
+        if: success()
         run: |
           mkdir -p release
           SOURCE_DIR="${{ env.SOURCE_DIR }}"
@@ -119,19 +177,15 @@ jobs:
 
           echo "Looking for firmware files in: $TARGET_DIR"
 
-          # Copy all firmware files (factory, sysupgrade, etc.)
           find "$TARGET_DIR" -maxdepth 1 -type f \( -name "*.bin" -o -name "*.itb" -o -name "*.ubi" -o -name "*.img.gz" -o -name "*.tar.gz" \) -exec cp {} release/ \; 2>/dev/null || true
 
-          # Copy packages
           find "$TARGET_DIR" -name "packages" -type d | while read pkgdir; do
             cp -r "$pkgdir" release/packages 2>/dev/null || true
           done
 
-          # Copy sha256sums and manifest
           cp "$TARGET_DIR"/sha256sums release/ 2>/dev/null || true
           cp "$TARGET_DIR"/*manifest* release/ 2>/dev/null || true
 
-          # Generate build info
           {
             echo "Build Time: $(date '+%Y-%m-%d %H:%M:%S')"
             echo "Source Repo: ${{ env.REPO_URL }}"
@@ -142,12 +196,12 @@ jobs:
             grep -E "^CONFIG_TARGET_BOARD|^CONFIG_TARGET_SUBTARGET|^CONFIG_TARGET_PROFILE|^CONFIG_TARGET_ARCH_PACKAGES|^CONFIG_LINUX" ${SOURCE_DIR}/.config
           } > release/BUILD_INFO.txt
 
-          # List all output files
           echo "======= Generated Files ======="
           ls -lh release/
           echo "files=$(ls release/ | tr '\n' ' ')" >> $GITHUB_ENV
 
       - name: Upload firmware artifacts
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: C2000Max-ImmortalWrt-Firmware
@@ -155,9 +209,9 @@ jobs:
           retention-days: 30
 
       - name: Build summary
+        if: success()
         run: |
-          echo "✅ Build completed!"
+          echo "Build completed!"
           echo "Download the firmware from the 'Artifacts' section of this workflow run."
-          echo ""
-          echo "📁 Firmware files location: release/"
           ls -lh release/
+
